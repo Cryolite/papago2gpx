@@ -1,0 +1,1086 @@
+#!/usr/bin/env python3
+
+import re
+import datetime
+import math
+import pathlib
+import os
+import io
+import argparse
+import subprocess
+import xml.sax.saxutils
+from typing import (Optional, List, Iterable)
+import sys
+
+
+_DEFAULT_TRACK_TYPE = 'Dashcam track'
+
+
+class Arguments(object):
+    def __init__(self):
+        parser = argparse.ArgumentParser(
+            prog='papago2gpx', description='Extract GPS data from MP4 video\
+ files created by PAPAGO! dashcams, and format them into a GPX file.')
+        parser.add_argument('input_paths', nargs='+',
+                            help='The path to an input file or directory.',
+                            metavar='INPUT_PATH')
+        parser.add_argument('--name', help='The name of the GPX file to\
+ output. Default to 16 deciaml digits representing the first GPS record time.',
+                            metavar='NAME')
+        parser.add_argument('--description', help='The description of the GPX\
+ file to output.', metavar='DESCRIPTION')
+        parser.add_argument('--author-name', help='The name of the author of\
+ the GPX file to output.', metavar='AUTHOR_NAME')
+        parser.add_argument('--author-email', help='The Email address of the\
+ author of the GPX file to output.', metavar='AUTHOR_EMAIL')
+        parser.add_argument('--copyright', help="The copyright holder of the\
+ GPX file to output. Default to `AUTHOR_NAME'.", metavar='COPYRIGHT')
+        parser.add_argument('--copyright-year', help="The copyright year of\
+ the GPX file to output. Default to the year the file is created.",
+                            metavar='COPYRIGHT_YEAR')
+        parser.add_argument('--copyright-license', help='A link to an external\
+ file containing license text.', metavar='LICENSE')
+        parser.add_argument('--keywords', help='Keywords associated with the\
+ GPX file to output.', metavar='KEYWORDS')
+        parser.add_argument('--track-name', help='The name of the track.',
+                            metavar='TRACK_NAME')
+        parser.add_argument(
+            '--track-comment', help='The comment of the track.',
+            metavar='TRACK_COMMENT')
+        parser.add_argument('--track-description', help="The description of\
+ the track.", metavar='TRACK_DESCRIPTION')
+        parser.add_argument(
+            '--track-type', default=_DEFAULT_TRACK_TYPE,
+            help=f"The type of the track. Default to `{_DEFAULT_TRACK_TYPE}'.")
+        parser.add_argument('--csv', action='store_true',
+                            help='Write a CSV file instead of GPX file.')
+        parser.add_argument('--overwrite', action='store_true',
+                            help='Allow to overwrite an existing file.')
+
+        args = parser.parse_args()
+
+        self._input_paths = []
+        for input_path in args.input_paths:
+            input_path = pathlib.Path(input_path)
+            if not input_path.exists():
+                print(f"{input_path}: File does not exist.", file=sys.stderr)
+                sys.exit(1)
+            self._input_paths.append(input_path)
+
+        self._name = args.name
+
+        self._description = args.description
+
+        self._author_name = args.author_name
+
+        self._author_email = args.author_email
+
+        self._copyright = args.copyright
+        if self._copyright is None and self._author_name is not None:
+            self._copyright = self._author_name
+
+        self._copyright_year = args.copyright_year
+        if self._copyright_year is not None and self._copyright is None:
+            print("`--copyright-year' is specified, but `--copyright' is not.",
+                  file=sys.stderr)
+            sys.exit(1)
+        if self._copyright_year is None and self._copyright is not None:
+            utc_now = datetime.datetime.now(datetime.timezone.utc)
+            local_aware_now = utc_now.astimezone()
+            self._copyright_year = local_aware_now.year
+
+        self._copyright_license = args.copyright_license
+        if self._copyright_license is not None and self._copyright is None:
+            print("`--copyright-license' is specified, but `--copyright' is\
+ not.", file=sys.stderr)
+            sys.exit(1)
+
+        self._keywords = args.keywords
+
+        self._track_name = args.track_name
+
+        self._track_comment = args.track_comment
+
+        self._track_description = args.track_description
+
+        self._track_type = args.track_type
+        if self._track_type is None:
+            self._track_type = _DEFAULT_TRACK_TYPE
+        if self._track_type == '':
+            self._track_type = None
+
+        self._csv = args.csv
+
+        self._overwrite = args.overwrite
+
+    @property
+    def input_paths(self) -> List[pathlib.Path]:
+        return self._input_paths
+
+    @property
+    def name(self) -> Optional[str]:
+        return self._name
+
+    @property
+    def description(self) -> Optional[str]:
+        return self._description
+
+    @property
+    def author_name(self) -> Optional[str]:
+        return self._author_name
+
+    @property
+    def author_email(self) -> Optional[str]:
+        return self._author_email
+
+    @property
+    def copyright(self) -> Optional[str]:
+        return self._copyright
+
+    @property
+    def copyright_year(self) -> Optional[int]:
+        return self._copyright_year
+
+    @property
+    def copyright_license(self) -> Optional[str]:
+        return self._copyright_license
+
+    @property
+    def keywords(self) -> Optional[str]:
+        return self._keywords
+
+    @property
+    def track_name(self) -> Optional[str]:
+        return self._track_name
+
+    @property
+    def track_comment(self) -> Optional[str]:
+        return self._track_comment
+
+    @property
+    def track_description(self) -> Optional[str]:
+        return self._track_description
+
+    @property
+    def track_type(self) -> Optional[str]:
+        return self._track_type
+
+    @property
+    def csv(self) -> bool:
+        return self._csv
+
+    @property
+    def overwrite(self) -> bool:
+        return self._overwrite
+
+
+class BrokenMp4FileError(RuntimeError):
+    def __init__(self, message: str):
+        super().__init__(message)
+
+
+class GpsDataError(RuntimeError):
+    def __init__(self, message: str):
+        super().__init__(message)
+
+
+class GpsDataBlockIndex(object):
+    def __init__(self, position: int, size: int):
+        if position <= 0:
+            raise ValueError(f"An invalid position: `{position}'.")
+        if size <= 0:
+            raise ValueError(f"An invalid size: `{size}'.")
+        self._position = position
+        self._size = size
+
+    @property
+    def position(self) -> int:
+        return self._position
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+
+def get_gps_data_block_indices(mp4_file: io.FileIO) -> List[GpsDataBlockIndex]:
+    target_box_path = ['moov', 'gps ']
+    while True:
+        box_size = mp4_file.read(4)
+        if len(box_size) == 0:
+            raise GpsDataError(
+                f'{mp4_file.name}: Could not find any GPS data block index.')
+        if len(box_size) < 4:
+            error_position = format(mp4_file.tell() - len(box_size), '#010x')
+            raise BrokenMp4FileError(f'{mp4_file.name}:{error_position}:\
+ Expect the size of a box, but got EOF.')
+        box_size = int.from_bytes(box_size, 'big')
+
+        box_type = mp4_file.read(4)
+        if len(box_type) < 4:
+            error_position = format(mp4_file.tell() - len(box_type), '#010x')
+            raise BrokenMp4FileError(f'{mp4_file.name}:{error_position}:\
+ Expect the type of a box, but got EOF.')
+        box_type = box_type.decode('UTF-8')
+
+        if box_size == 0:
+            box_size = None
+            next_position = None
+        elif box_size == 1:
+            box_size = mp4_file.read(8)
+            if len(box_size) < 8:
+                error_position = format(mp4_file.tell() - len(box_size),
+                                        '#010x')
+                raise BrokenMp4FileError(f'{mp4_file.name}:{error_position}:\
+ Expect the size of a box, but got EOF.')
+            box_size = int.from_bytes(box_size, 'big')
+            next_position = mp4_file.tell() + box_size - 16
+        else:
+            next_position = mp4_file.tell() + box_size - 8
+
+        if box_type == target_box_path[0]:
+            target_box_path.pop(0)
+            if len(target_box_path) == 0:
+                break
+        else:
+            if next_position is None:
+                raise GpsDataError(f'{mp4_file.name}: Could not find any GPS'
+                                   ' data block index.')
+            mp4_file.seek(next_position)
+            if mp4_file.tell() != next_position:
+                raise BrokenMp4FileError(f'{mp4_file.name}: The size of a box\
+ is not equal to the actual one.')
+
+    unknown = mp4_file.read(4)
+    if len(unknown) < 4:
+        error_position = format(mp4_file.tell() - len(unknown), '#010x')
+        raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect a'
+                           ' big-endian 32-bit unsigned integer, but got EOF.')
+    unknown = int.from_bytes(unknown, 'big')
+    if unknown != 257:
+        error_position = format(mp4_file.tell() - 4, '#010x')
+        raise GpsDataError(f"{mp4_file.name}:{error_position}: Expect a\
+ big-endian 32-bit unsigned integer with value `257', but got `{unknown}'.")
+
+    gps_data_block_count = mp4_file.read(4)
+    if len(gps_data_block_count) < 4:
+        error_position = format(mp4_file.tell() - len(gps_data_block_count),
+                                '#010x')
+        raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect a'
+                           ' big-endian 32-bit unsigned integer, but got EOF.')
+    gps_data_block_count = int.from_bytes(gps_data_block_count, 'big')
+
+    gps_data_block_indices = []
+    for i in range(gps_data_block_count):
+        position = mp4_file.read(4)
+        if len(position) < 4:
+            error_position = format(mp4_file.tell() - len(position), '#010x')
+            raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect the'
+                               ' position of a GPS data block, but got EOF.')
+        position = int.from_bytes(position, 'big')
+        if position < 0:
+            error_position = format(mp4_file.tell() - 4, '#010x')
+            raise GpsDataError(f"{mp4_file.name}:{error_position}: Expect the\
+ position of a GPS data block, but got an invalid value `{position}'.")
+
+        size = mp4_file.read(4)
+        if len(size) < 4:
+            error_position = format(mp4_file.tell() - len(size), '#010x')
+            raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect the'
+                               ' size of a GPS data block, but got EOF.')
+        size = int.from_bytes(size, 'big')
+        if size < 0:
+            error_position = format(mp4_file.tell() - 4, '#010x')
+            raise GpsDataError(f"{mp4_file.name}:{error_position}: Expect the\
+ size of a GPS data block, but got an invalid value `{size}'.")
+
+        if position == 0 or size == 0:
+            print(f'{mp4_file.name}: Warning: The index of GPS data blocks is\
+ not recorded.', file=sys.stderr)
+        else:
+            gps_data_block_index = GpsDataBlockIndex(position, size)
+            gps_data_block_indices.append(gps_data_block_index)
+
+    if mp4_file.tell() != next_position:
+        error_position = format(mp4_file.tell(), '#010x')
+        raise GpsDataError(f'{mp4_file_path}:{error_position}: Expect EOF, but'
+                           ' find additional data.')
+
+    return gps_data_block_indices
+
+
+def read_little_endian_single(mp4_file: io.FileIO) -> float:
+    data = mp4_file.read(4)
+    if len(data) < 4:
+        error_position = format(mp4_file.tell() - len(data), '#010x')
+        raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect a\
+ little-endian single-precision floating point number, but got EOF.')
+    data = int.from_bytes(data, 'little')
+
+    sign = (data & 0x80000000) >> 31
+    exponent = ((data & 0x7F800000) >> 23) - 127
+    mantissa = (data & 0x007FFFFF) | 0x00800000
+
+    sign = '+' if sign == 0 else '-'
+    exponent = str(exponent - 23)
+    mantissa_hex = format(mantissa, '08x')
+    return float.fromhex(f'{sign}0x{mantissa_hex}p{exponent}')
+
+
+class Time(object):
+    def __init__(self, time: datetime.datetime):
+        if time.tzinfo is None:
+            raise ValueError(
+                "Expect an aware `datetime' object, but got naive one.")
+
+        self._time = time.astimezone(datetime.timezone.utc)
+
+    def as_local_time(self) -> datetime.datetime:
+        return self._time.astimezone()
+
+    def __repr__(self) -> str:
+        result = self._time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        return re.sub('(\\+\\d{2})(\\d{2})$', '\\1:\\2', result)
+
+    def __lt__(self, other) -> bool:
+        return self._time < other._time
+
+    def __eq__(self, other) -> bool:
+        return self._time == other._time
+
+
+class Latitude(object):
+    def __init__(self, degree: float):
+        if degree < -90 or 90 < degree:
+            raise ValueError("An invalid latitude degree: `{degree}'.")
+
+        self._degree = degree
+
+    def __repr__(self) -> str:
+        return format(self._degree, '.6F')
+
+    def __lt__(self, other) -> bool:
+        return self._degree < other._degree
+
+    def __eq__(self, other) -> bool:
+        return self._degree == other._degree
+
+
+class Longitude(object):
+    def __init__(self, degree: float):
+        if degree < -180 or 180 < degree:
+            raise ValueError("An invalid longitude degree: `{degree}'.")
+
+        self._degree = degree
+
+    def __repr__(self) -> str:
+        return format(self._degree, '.6F')
+
+    def __lt__(self, other) -> bool:
+        return self._degree < other._degree
+
+    def __eq__(self, other) -> bool:
+        return self._degree == other._degree
+
+
+class Speed(object):
+    def __init__(self, meter_per_second: float):
+        self._meter_per_second = meter_per_second
+
+    def __repr__(self) -> str:
+        return format(self._meter_per_second, '.2F')
+
+
+class Azimuth(object):
+    def __init__(self, degree: float):
+        if degree < 0 or 360 <= degree:
+            raise ValueError(f"An invalid azimuth degree: `{degree}'.")
+
+        self._degree = degree
+
+    def __repr__(self) -> str:
+        return format(self._degree, '.2F')
+
+
+class TrackPoint(object):
+    def __init__(self, time: Time, status: str, latitude: Optional[Latitude],
+                 longitude: Optional[Longitude], speed: Speed,
+                 azimuth: Azimuth, x_acceleration: int, y_acceleration: int,
+                 z_acceleration: int):
+        if (status == 'V') != (latitude is None):
+            raise ValueError('Inconsistent arguments:'
+                             f' status = {status}, latitude = {latitude}')
+        if (status == 'V') != (longitude is None):
+            raise ValueError('Inconsistent arguments:'
+                             f' status = {status}, longitude = {longitude}')
+
+        self._time = time
+        self._status = status
+        self._latitude = latitude
+        self._longitude = longitude
+        self._speed = speed
+        self._azimuth = azimuth
+        self._x_acceleration = x_acceleration
+        self._y_acceleration = y_acceleration
+        self._z_acceleration = z_acceleration
+
+    @property
+    def time(self) -> Time:
+        return self._time
+
+    @property
+    def status(self) -> str:
+        return self._status
+
+    @property
+    def latitude(self) -> Optional[Latitude]:
+        return self._latitude
+
+    @property
+    def longitude(self) -> Optional[Longitude]:
+        return self._longitude
+
+    @property
+    def speed(self) -> Speed:
+        return self._speed
+
+    @property
+    def azimuth(self) -> Azimuth:
+        return self._azimuth
+
+    @property
+    def x_acceleration(self) -> int:
+        return self._x_acceleration
+
+    @property
+    def y_acceleration(self) -> int:
+        return self._y_acceleration
+
+    @property
+    def z_acceleration(self) -> int:
+        return self._z_acceleration
+
+    @property
+    def name(self) -> str:
+        local_time = self._time.as_local_time()
+        return local_time.strftime('%Y%m%d%H%M%S')
+
+    def format_as_csv(self) -> str:
+        local_time = self._time.as_local_time()
+        result = local_time.strftime('%Y/%m/%d %H:%M:%S')
+        result += f',{self._status}'
+        latitude = str(self._latitude) if self._latitude is not None else ''
+        result += f',{latitude}'
+        longitude = str(self._longitude) if self._longitude is not None else ''
+        result += f',{longitude}'
+        result += f',{self._speed}'
+        result += f',{self._azimuth}'
+        result += f',{self._x_acceleration}'
+        result += f',{self._y_acceleration}'
+        result += f',{self._z_acceleration}'
+        return result
+
+    def __repr__(self) -> str:
+        latitude = str(self._latitude) if self._latitude is not None else ''
+        longitude = str(self._longitude) if self._longitude is not None else ''
+        return f'{self._time},{latitude},{longitude}'
+
+    def __lt__(self, other) -> bool:
+        return self._time < other._time
+
+    def __eq__(self, other) -> bool:
+        return self._time == other._time and self._latitude == other._latitude\
+            and self._longitude == other._longitude
+
+
+class TrackSegment(object):
+    def __init__(self):
+        self._track_points = []
+
+    def append_track_point(self, track_point: TrackPoint) -> None:
+        self._track_points.append(track_point)
+
+    def __len__(self) -> int:
+        return len(self._track_points)
+
+    def __iter__(self) -> Iterable[TrackPoint]:
+        return iter(self._track_points)
+
+
+def parse_mp4_file(mp4_file_path: pathlib.Path) -> List[TrackPoint]:
+    track_points = []
+
+    with open(mp4_file_path, 'rb') as mp4_file:
+        gps_data_block_indices = get_gps_data_block_indices(mp4_file)
+
+        for gps_data_block_index in gps_data_block_indices:
+            mp4_file.seek(gps_data_block_index.position)
+            if mp4_file.tell() != gps_data_block_index.position:
+                error_position = gps_data_block_index.position
+                raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect'
+                                   ' a GPS data block, but got EOF.')
+
+            large_block_size = mp4_file.read(4)
+            if len(large_block_size) < 4:
+                error_position = format(
+                    mp4_file.tell() - len(large_block_size), '#010x')
+                raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect\
+ the size of a GPS data block, but got EOF.')
+            large_block_size = int.from_bytes(large_block_size, 'big')
+            if large_block_size != gps_data_block_index.size:
+                error_position = format(mp4_file.tell() - 4, '#010x')
+                raise GpsDataError(f'{mp4_file_path}:{error_position}: The\
+ size of a GPS data block is not equal to the one stored in the index.')
+
+            large_block_end = mp4_file.tell() - 4 + large_block_size
+
+            signature = mp4_file.read(8)
+            if len(signature) < 8:
+                error_position = format(mp4_file.tell() - len(signature),
+                                        '#010x')
+                raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect\
+ the signature of a GPS data block, but got EOF.')
+            signature = signature.decode('UTF-8')
+            if signature != 'freeGPS ':
+                error_position = format(mp4_file.tell() - 8, '#010x')
+                raise GpsDataError(f"{mp4_file.name}:{error_position}: Expect\
+ `freeGPS ' as the signature of a GPS data block, but got `{signature}'.")
+
+            small_block_size = mp4_file.read(4)
+            if len(small_block_size) < 4:
+                error_position = format(
+                    mp4_file.tell() - len(small_block_size), '#010x')
+                raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect\
+ the size of a GPS data block, but got EOF.')
+            small_block_size = int.from_bytes(small_block_size, 'little')
+            if small_block_size != 88:
+                error_position = format(mp4_file.tell() - 4, '#010x')
+                raise GpsDataError(f"{mp4_file.name}:{error_position}: Expect\
+ `88' as the size of a GPS data block, but got `{small_block_size}'.")
+
+            small_block_end = mp4_file.tell() + small_block_size
+
+            padding = mp4_file.read(32)
+            if len(padding) < 32:
+                error_position = format(mp4_file.tell() - len(padding),
+                                        '#010x')
+                raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect'
+                                   ' zero padding, but got EOF.')
+            for j, b in enumerate(padding):
+                if b != 0:
+                    error_position = format(mp4_file.tell() - 32 + j, '#010x')
+                    byte = format(b, '#04x')
+                    raise GpsDataError(f"{mp4_file.name}:{error_position}:\
+ Expect zero padding, but got an invalid byte `{byte}'.")
+
+            hour = mp4_file.read(4)
+            if len(hour) < 4:
+                error_position = format(mp4_file.tell() - len(hour), '#010x')
+                raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect'
+                                   ' the hour of time, but got EOF.')
+            hour = int.from_bytes(hour, 'little')
+            if hour < 0 or 24 <= hour:
+                error_position = format(mp4_file.tell() - 4, '#010x')
+                raise GpsDataError(f"{mp4_file.name}:{error_position}: Expect\
+ the hour of time, but got an invalid value `{hour}'.")
+
+            minute = mp4_file.read(4)
+            if len(minute) < 4:
+                error_position = format(mp4_file.tell() - len(minute), '#010x')
+                raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect'
+                                   ' the minute of time, but got EOF.')
+            minute = int.from_bytes(minute, 'little')
+            if minute < 0 or 60 <= minute:
+                error_position = format(mp4_file.tell() - 4, '#010x')
+                raise GpsDataError(f"{mp4_file.name}:{error_position}: Expect\
+ the minute of time, but got an invalid value `{minute}'.")
+
+            second = mp4_file.read(4)
+            if len(second) < 4:
+                error_position = format(mp4_file.tell() - len(second), '#010x')
+                raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect'
+                                   ' the second of time, but got EOF.')
+            second = int.from_bytes(second, 'little')
+            if second < 0 or 60 <= second:
+                error_position = format(mp4_file.tell() - 4, '#010x')
+                raise GpsDataError(f"{mp4_file.name}:{error_position}: Expect\
+ the second of time, but got an invalid value `{second}'.")
+
+            year = mp4_file.read(4)
+            if len(year) < 4:
+                error_position = format(mp4_file.tell() - len(year), '#010x')
+                raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect'
+                                   ' the year of time, but got EOF.')
+            year = int.from_bytes(year, 'little')
+            year += 2000
+
+            month = mp4_file.read(4)
+            if len(month) < 4:
+                error_position = format(mp4_file.tell() - len(month), '#010x')
+                raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect'
+                                   ' the month of time, but got EOF.')
+            month = int.from_bytes(month, 'little')
+            if month < 1 or 12 < month:
+                error_position = format(mp4_file.tell() - 4, '#010x')
+                raise GpsDataError(f"{mp4_file.name}:{error_position}: Expect\
+ the month of time, but got an invalid value `{month}'.")
+
+            day = mp4_file.read(4)
+            if len(day) < 4:
+                error_position = format(mp4_file.tell() - len(day), '#010x')
+                raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect'
+                                   ' the day of time, but got EOF.')
+            day = int.from_bytes(day, 'little')
+            if day < 1 or 31 < day:
+                error_position = format(mp4_file.tell() - 4, '#010x')
+                raise GpsDataError(f"{mp4_file.name}:{error_position}: Expect\
+ the day of time, but got an invalid value `{day}'.")
+
+            time = datetime.datetime.now(datetime.timezone.utc)
+            time = time.astimezone()
+            time = time.replace(year=year, month=month, day=day, hour=hour,
+                                minute=minute, second=second, microsecond=0)
+            time = Time(time)
+
+            status = mp4_file.read(1)
+            if len(status) < 1:
+                error_position = format(mp4_file.tell() - len(status), '#010x')
+                raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect'
+                                   ' a status character, but got EOF.')
+            status = status.decode('UTF-8')
+            if status not in ('A', 'V'):
+                error_position = format(mp4_file.tell() - 1, '#010x')
+                raise GpsDataError(f"{mp4_file.name}:{error_position}: Expect\
+ `A' or `V' as a status character, but got an invalid character `{status}'.")
+
+            latitude_type = mp4_file.read(1)
+            if len(latitude_type) < 1:
+                error_position = format(
+                    mp4_file.tell() - len(latitude_type), '#010x')
+                raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect'
+                                   ' a latitude type, but got EOF.')
+            latitude_type = latitude_type.decode('UTF-8')
+            if status == 'A':
+                if latitude_type not in ('N', 'S'):
+                    error_position = format(mp4_file.tell() - 1, '#010x')
+                    raise GpsDataError(
+                        f"{mp4_file.name}:{error_position}: Expect `N' or `S'\
+ as a latitude type, but got an invalid character `{latitude_type}'.")
+            else:
+                assert(status == 'V')
+                if latitude_type != '0':
+                    error_position = format(mp4_file.tell() - 1, '#010x')
+                    raise GpsDataError(f"{mp4_file.name}:{error_position}:\
+ Expect `0' as a latitude type, but got an invalid character\
+ `{latitude_type}'.")
+
+            longitude_type = mp4_file.read(1)
+            if len(longitude_type) < 1:
+                error_position = format(
+                    mp4_file.tell() - len(longitude_type), '#010x')
+                raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect'
+                                   ' a longitude type, but got EOF.')
+            longitude_type = longitude_type.decode('UTF-8')
+            if status == 'A':
+                if longitude_type not in ('E', 'W'):
+                    error_position = format(mp4_file.tell() - 1, '#010x')
+                    raise GpsDataError(
+                        f"{mp4_file.name}:{error_position}: Expect `E' or `W'\
+ as a longitude type, but got an invalid character `{longitude_type}'.")
+            else:
+                assert(status == 'V')
+                if longitude_type != '0':
+                    error_position = format(mp4_file.tell() - 1, '#010x')
+                    raise GpsDataError(f"{mp4_file.name}:{error_position}:\
+ Expect `0' as a longitude type, but got an invalid character\
+ `{longitude_type}'.")
+
+            padding = mp4_file.read(1)
+            if len(padding) < 1:
+                error_position = format(
+                    mp4_file.tell() - len(padding), '#010x')
+                raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect'
+                                   ' zero padding, but got EOF.')
+            if padding[0] != 0:
+                error_position = format(mp4_file.tell() - 1, '#010x')
+                byte = format(padding[0], '#04x')
+                raise GpsDataError(f"{mp4_file.name}:{error_position}: Expect\
+ zero padding, but got an invalid byte `{byte}'.")
+
+            if status == 'A':
+                latitude_dmm = read_little_endian_single(mp4_file)
+                latitude_degree = math.floor(latitude_dmm / 100)
+                if latitude_degree < 0 or 90 < latitude_degree:
+                    error_position = format(mp4_file.tell() - 4, '#010x')
+                    raise GpsDataError(f"{mp4_file.name}:{error_position}:\
+ Expect a latitude in DMM format, but got an invalid value `{latitude_dmm}'.")
+                latitude_minute = latitude_dmm - latitude_degree * 100
+                if latitude_minute < 0 or 60 <= latitude_minute:
+                    error_position = format(mp4_file.tell() - 4, '#010x')
+                    raise GpsDataError(f"{mp4_file.name}:{error_position}:\
+ Expect a latitude in DMM format, but got an invalid value `{latitude_dmm}'.")
+                latitude_degree += latitude_minute / 60
+                latitude = Latitude(latitude_degree)
+            else:
+                assert(status == 'V')
+                padding = mp4_file.read(4)
+                if len(padding) < 4:
+                    error_position = format(
+                        mp4_file.tell() - len(padding), '#010x')
+                    raise GpsDataError(f'{mp4_file.name}:{error_position}:'
+                                       ' Expect zero padding, but got EOF.')
+                for j, b in enumerate(padding):
+                    if b != 0:
+                        error_position = format(
+                            mp4_file.tell() - 4 + j, '#010x')
+                        byte = format(b, '#04x')
+                        raise GpsDataError(f"{mp4_file.name}:{error_position}:\
+ Expect zero padding, but got an invalid byte `{byte}'.")
+                latitude = None
+
+            if status == 'A':
+                longitude_dmm = read_little_endian_single(mp4_file)
+                longitude_degree = math.floor(longitude_dmm / 100)
+                if longitude_degree < 0 or 180 < longitude_degree:
+                    error_position = format(mp4_file.tell() - 4, '#010x')
+                    raise GpsDataError(f"{mp4_file.name}:{error_position}:\
+ Expect a longitude in DMM format, but got an invalid value\
+ `{longitude_dmm}'.")
+                longitude_minute = longitude_dmm - longitude_degree * 100
+                if longitude_minute < 0 or 60 <= longitude_minute:
+                    error_position = format(mp4_file.tell() - 4, '#010x')
+                    raise GpsDataError(f"{mp4_file.name}:{error_position}:\
+ Expect a longitude in DMM format, but got an invalid value\
+ `{longitude_dmm}'.")
+                longitude_degree += longitude_minute / 60
+                longitude = Longitude(longitude_degree)
+            else:
+                assert(status == 'V')
+                padding = mp4_file.read(4)
+                if len(padding) < 4:
+                    error_position = format(
+                        mp4_file.tell() - len(padding), '#010x')
+                    raise GpsDataError(f'{mp4_file.name}:{error_position}:'
+                                       ' Expect zero padding, but got EOF.')
+                for j, b in enumerate(padding):
+                    if b != 0:
+                        error_position = format(
+                            mp4_file.tell() - 4 + j, '#010x')
+                        byte = format(b, '#04x')
+                        raise GpsDataError(f"{mp4_file.name}:{error_position}:\
+ Expect zero padding, but got an invalid byte `{byte}'.")
+                longitude = None
+
+            speed = read_little_endian_single(mp4_file)
+            # Presume that speed is recorded in knots.
+            speed *= (1852 / 3600)
+            speed = Speed(speed)
+
+            azimuth = read_little_endian_single(mp4_file)
+            if azimuth < 0 or 360 <= azimuth:
+                error_position = format(mp4_file.tell() - 4, '#010x')
+                raise GpsDataError(f"{mp4_file.name}:{error_position}: Expect\
+ azimuth degree, but got an invalid value `{azimuth}'.")
+            azimuth = Azimuth(azimuth)
+
+            x_acceleration = mp4_file.read(4)
+            if len(x_acceleration) < 4:
+                error_position = format(
+                    mp4_file.tell() - len(x_acceleration), '#010x')
+                raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect'
+                                   ' X-axis acceleration, but got EOF.')
+            x_acceleration = int.from_bytes(
+                x_acceleration, 'little', signed=True)
+
+            y_acceleration = mp4_file.read(4)
+            if len(y_acceleration) < 4:
+                error_position = format(
+                    mp4_file.tell() - len(y_acceleration), '#010x')
+                raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect'
+                                   ' Y-axis acceleration, but got EOF.')
+            y_acceleration = int.from_bytes(
+                y_acceleration, 'little', signed=True)
+
+            z_acceleration = mp4_file.read(4)
+            if len(z_acceleration) < 4:
+                error_position = format(
+                    mp4_file.tell() - len(z_acceleration), '#010x')
+                raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect'
+                                   ' Z-axis acceleration, but got EOF.')
+            z_acceleration = int.from_bytes(
+                z_acceleration, 'little', signed=True)
+
+            if mp4_file.tell() != small_block_end:
+                error_position = format(mp4_file.tell(), '#010x')
+                raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect\
+ the end of a GPS data block, but got additional data.')
+
+            padding_size = large_block_end - small_block_end
+            padding = mp4_file.read(padding_size)
+            if len(padding) < padding_size:
+                error_position = format(
+                    mp4_file.tell() - len(padding), '#010x')
+                raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect\
+ {padding_size}-byte zero padding, but got EOF.')
+            for j, b in enumerate(padding):
+                if b != 0:
+                    error_position = format(small_block_size + j, '#x010')
+                    byte = format(b, '#04x')
+                    raise GpsDataError(f"{mp4_file.name}:{error_position}:\
+ Expect zero padding, but got an invalid byte `{byte}'.")
+
+            track_point = TrackPoint(
+                time, status, latitude, longitude, speed, azimuth,
+                x_acceleration, y_acceleration, z_acceleration)
+            track_points.append(track_point)
+
+    return track_points
+
+
+def read_input_paths(input_paths: List[pathlib.Path]) -> List[TrackPoint]:
+    track_points = []
+
+    for input_path in input_paths:
+        if input_path.is_dir():
+            file_paths = []
+            for dirpath, dirnames, filenames in os.walk(input_path):
+                dirpath = pathlib.Path(dirpath)
+                for filename in filenames:
+                    file_path = dirpath / filename
+                    if file_path.suffix not in ('.mp4', '.MP4'):
+                        continue
+                    file_paths.append(file_path)
+
+            file_paths.sort()
+
+            for file_path in file_paths:
+                track_points.extend(parse_mp4_file(file_path))
+        else:
+            track_points.extend(parse_mp4_file(input_path))
+
+    return track_points
+
+
+def write_csv_file(args: Arguments,
+                   track_points: List[TrackPoint]) -> pathlib.Path:
+    if args.name is None:
+        print("`--name' is required to output a CSV file.", file=sys.stderr)
+        sys.exit(1)
+
+    csv_file_path = pathlib.Path(f'{args.name}.csv')
+    if csv_file_path.exists():
+        if not args.overwrite:
+            print(f"{csv_file_path}: File already exists.", file=sys.stderr)
+            sys.exit(1)
+
+    with open(csv_file_path, 'w') as csv_file:
+        for track_point in track_points:
+            print(track_point.format_as_csv(), file=csv_file)
+
+    return csv_file_path
+
+
+def create_track_segments(
+        track_points: List[TrackPoint]) -> List[TrackSegment]:
+    new_track_points = []
+    for track_point in track_points:
+        if track_point.status != 'A':
+            assert(track_point.latitude is None)
+            assert(track_point.longitude is None)
+            continue
+        assert(track_point.latitude is not None)
+        assert(track_point.longitude is not None)
+        new_track_points.append(track_point)
+    track_points = new_track_points
+
+    track_points.sort()
+
+    if len(track_points) == 0:
+        return []
+
+    unique_track_points = []
+    unique_track_points.append(track_points[0])
+
+    for track_point in track_points[1:]:
+        prev_track_point = unique_track_points[-1]
+
+        if track_point == prev_track_point:
+            continue
+
+        if track_point.time == prev_track_point.time:
+            if track_point.latitude != prev_track_point.latitude:
+                raise RuntimeError('There exist track points with the same'
+                                   ' timestamp but different coordinates.')
+            if track_point.longitude != prev_track_point.longitude:
+                raise RuntimeError('There exist track points with the same'
+                                   ' timestamp but different coordinates.')
+
+        unique_track_points.append(track_point)
+
+    track_segments = []
+    track_segments.append(TrackSegment())
+    for track_point in unique_track_points:
+        track_segments[0].append_track_point(track_point)
+
+    return track_segments
+
+
+def as_xml_attribute(data: str) -> str:
+    return xml.sax.saxutils.quoteattr(data)
+
+
+def as_xml_data(data: str) -> str:
+    return xml.sax.saxutils.escape(data)
+
+
+def get_local_time_in_iso8601() -> str:
+  utc_now = datetime.datetime.now(datetime.timezone.utc)
+  local_aware_now = utc_now.astimezone()
+  local_time_in_iso8601 = local_aware_now.strftime('%Y-%m-%dT%H:%M:%S%z')
+  return re.sub('([+-]\\d{2})(\\d{2})$', '\\1:\\2', local_time_in_iso8601)
+
+
+def write_gpx_file(args: Arguments,
+                   track_segments: List[TrackSegment]) -> pathlib.Path:
+    all_track_points = []
+    for track_segment in track_segments:
+        for track_point in track_segment:
+            all_track_points.append(track_point)
+
+    name = args.name
+    if name is None:
+        if len(all_track_points) == 0:
+            raise ValueError(
+                "`--name' is not specified, and there is no track point.")
+        all_track_points.sort()
+        name = all_track_points[0].name
+
+    gpx_file_path = pathlib.Path(f'{name}.gpx')
+
+    bounds = None
+    if len(all_track_points) > 0:
+        latitudes = list(t.latitude for t in all_track_points)
+        latitudes.sort()
+        longitudes = list(t.longitude for t in all_track_points)
+        longitudes.sort()
+        bounds = (latitudes[0], longitudes[0], latitudes[-1], longitudes[-1])
+
+    if gpx_file_path.exists():
+        if not args.overwrite:
+            print(f'{gpx_file_path}: Error: File already exists.',
+                  file=sys.stderr)
+            sys.exit(1)
+
+    with open(gpx_file_path, 'w') as gpx_file:
+        print('<?xml version="1.0" encoding="UTF-8" standalone="no" ?>',
+              file=gpx_file)
+        print('<gpx xmlns="http://www.topografix.com/GPX/1/1" version="1.1"'
+              ' creator="papago2gpx">', file=gpx_file)
+        print('  <metadata>', file=gpx_file)
+        print(f'    <name>{as_xml_data(name)}</name>', file=gpx_file)
+        if args.description is not None:
+            description = as_xml_data(args.description)
+            print(f'    <desc>{description}</desc>', file=gpx_file)
+        if args.author_name is not None or args.author_email is not None:
+            print('    <author>', file=gpx_file)
+            if args.author_name is not None:
+                author_name = as_xml_data(args.author_name)
+                print(f'      <name>{author_name}</name>', file=gpx_file)
+            if args.author_email is not None:
+                author_email_parts = args.author_email.split('@', 1)
+                if len(author_email_parts) != 2:
+                    raise RuntimeError(
+                        f'An invalid E-mail address: {args.author_email}')
+                author_email_id = as_xml_attribute(author_email_parts[0])
+                author_email_domain = as_xml_attribute(author_email_parts[1])
+                print(f'      <email id={author_email_id}\
+ domain={author_email_domain}/>', file=gpx_file)
+            print('    </author>', file=gpx_file)
+        if args.copyright is not None:
+            copyright = as_xml_attribute(args.copyright)
+            print(f'    <copyright author={copyright}', end='', file=gpx_file)
+            copyright_year = args.copyright_year
+            copyright_license = args.copyright_license
+            if copyright_year is not None or copyright_license is not None:
+                print('>', file=gpx_file)
+                if copyright_year is not None:
+                    copyright_year = as_xml_data(str(copyright_year))
+                    print(f'      <year>{copyright_year}</year>',
+                          file=gpx_file)
+                if copyright_license is not None:
+                    copyright_license = as_xml_data(copyright_license)
+                    print(f'      <license>{copyright_license}</license>',
+                          file=gpx_file)
+                print('    </copyright>', file=gpx_file)
+            else:
+                print('/>', file=gpx_file)
+        print(f'    <time>{get_local_time_in_iso8601()}</time>', file=gpx_file)
+        if args.keywords is not None:
+            keywords = as_xml_data(args.keywords)
+            print(f'    <keywords>{keywords}</keywords>', file=gpx_file)
+        if bounds is not None:
+            print(f'    <bounds minlat="{bounds[0]}" minlon="{bounds[1]}"\
+ maxlat="{bounds[2]}" maxlon="{bounds[3]}"/>', file=gpx_file)
+        print('  </metadata>', file=gpx_file)
+        print('  <trk>', file=gpx_file)
+        if args.track_name is not None:
+            track_name = as_xml_data(args.track_name)
+            print(f'    <name>{track_name}</name>', file=gpx_file)
+        if args.track_comment is not None:
+            track_comment = as_xml_data(args.track_comment)
+            print(f'    <cmt>{track_comment}</cmt>', file=gpx_file)
+        if args.track_description is not None:
+            track_description = as_xml_data(args.track_description)
+            print(f'    <desc>{track_description}</desc>', file=gpx_file)
+        if args.track_type is not None:
+            track_type = as_xml_data(args.track_type)
+            print(f'    <type>{track_type}</type>', file=gpx_file)
+        for track_segment in track_segments:
+            print('    <trkseg>', file=gpx_file)
+            for track_point in track_segment:
+                print(f'      <trkpt lat="{track_point.latitude}"\
+ lon="{track_point.longitude}">', file=gpx_file)
+                print(f'        <time>{track_point.time}</time>',
+                      file=gpx_file)
+                print('      </trkpt>', file=gpx_file)
+            print('    </trkseg>', file=gpx_file)
+        print('  </trk>', file=gpx_file)
+        print('</gpx>', file=gpx_file)
+
+    proc = subprocess.run(
+        ['xmllint', '--schema', 'gpx.xsd', str(gpx_file_path)],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, encoding='UTF-8')
+    if proc.returncode != 0:
+        print(f"""Failed to validate the GPX file `{gpx_file_path}'.
+command: {proc.args}
+stdout: {proc.stdout}
+stderr: {proc.stderr}
+returncode: {proc.returncode}""", file=sys.stderr)
+
+    return gpx_file_path
+
+
+if __name__ == '__main__':
+    args = Arguments()
+
+    track_points = read_input_paths(args.input_paths)
+
+    if args.csv:
+        csv_file_path = write_csv_file(args, track_points)
+        print(f"Succeeded! The result is output to `{csv_file_path}'.")
+        sys.exit(0)
+
+    track_segments = create_track_segments(track_points)
+
+    if args.name is None and len(track_segments) == 0:
+        print("`--name' is not specified, and there is no track segment.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if len(track_segments) == 0:
+        print('WARNING: There is no track segment.', file=sys.stderr)
+
+    gpx_file_path = write_gpx_file(args, track_segments)
+
+    print(f"Succeeded! The result is output to `{gpx_file_path}'.")
+    sys.exit(0)
