@@ -406,10 +406,10 @@ class TrackPoint(object):
                  longitude: Optional[Longitude], speed: Speed,
                  azimuth: Azimuth, x_acceleration: int, y_acceleration: int,
                  z_acceleration: int):
-        if (status == 'V') != (latitude is None):
+        if (status == 'V' or status is None) != (latitude is None):
             raise ValueError('Inconsistent arguments:'
                              f' status = {status}, latitude = {latitude}')
-        if (status == 'V') != (longitude is None):
+        if (status == 'V' or status is None) != (longitude is None):
             raise ValueError('Inconsistent arguments:'
                              f' status = {status}, longitude = {longitude}')
 
@@ -465,9 +465,13 @@ class TrackPoint(object):
         return local_time.strftime('%Y%m%d%H%M%S')
 
     def format_as_csv(self) -> str:
-        local_time = self._time.as_local_time()
-        result = local_time.strftime('%Y/%m/%d %H:%M:%S')
-        result += f',{self._status}'
+        if self._time is not None:
+            local_time = self._time.as_local_time()
+            result = local_time.strftime('%Y/%m/%d %H:%M:%S')
+        else:
+            result = ''
+        status = self._status if self._status is not None else ''
+        result += f',{status}'
         latitude = str(self._latitude) if self._latitude is not None else ''
         result += f',{latitude}'
         longitude = str(self._longitude) if self._longitude is not None else ''
@@ -611,7 +615,19 @@ def parse_mp4_file(mp4_file_path: pathlib.Path) -> List[TrackPoint]:
                 raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect'
                                    ' the year of time, but got EOF.')
             year = int.from_bytes(year, 'little')
-            year += 2000
+            if year == 0:
+                error_position = format(mp4_file.tell() - 4, '#010x')
+                if hour != 0:
+                    raise GpsDataError(f"{mp4_file.name}:{error_position}:"
+                                       " `year == 0' but `hour != 0'.")
+                if minute != 0:
+                    raise GpsDataError(f"{mp4_file.name}:{error_position}:"
+                                       " `year == 0' but `minute != 0'.")
+                if second != 0:
+                    raise GpsDataError(f"{mp4_file.name}:{error_position}:"
+                                       " `year == 0' but `second != 0'.")
+            else:
+                year += 2000
 
             month = mp4_file.read(4)
             if len(month) < 4:
@@ -619,7 +635,14 @@ def parse_mp4_file(mp4_file_path: pathlib.Path) -> List[TrackPoint]:
                 raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect'
                                    ' the month of time, but got EOF.')
             month = int.from_bytes(month, 'little')
-            if month < 1 or 12 < month:
+            if month == 0:
+                if year != 0:
+                    raise GpsDataError(f"{mp4_file.name}:{error_position}:"
+                                       " `year != 0' but `month == 0'.")
+                assert(hour == 0)
+                assert(minute == 0)
+                assert(second == 0)
+            elif month < 1 or 12 < month:
                 error_position = format(mp4_file.tell() - 4, '#010x')
                 raise GpsDataError(f"{mp4_file.name}:{error_position}: Expect\
  the month of time, but got an invalid value `{month}'.")
@@ -630,81 +653,118 @@ def parse_mp4_file(mp4_file_path: pathlib.Path) -> List[TrackPoint]:
                 raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect'
                                    ' the day of time, but got EOF.')
             day = int.from_bytes(day, 'little')
-            if day < 1 or 31 < day:
+            if day == 0:
+                if year != 0:
+                    raise GpsDataError(f"{mp4_file.name}:{error_position}:"
+                                       " `year != 0' but `day == 0'.")
+                assert(month == 0)
+                assert(hour == 0)
+                assert(minute == 0)
+                assert(second == 0)
+            elif day < 1 or 31 < day:
                 error_position = format(mp4_file.tell() - 4, '#010x')
                 raise GpsDataError(f"{mp4_file.name}:{error_position}: Expect\
  the day of time, but got an invalid value `{day}'.")
 
-            time = datetime.datetime.now(datetime.timezone.utc)
-            time = time.astimezone()
-            time = time.replace(year=year, month=month, day=day, hour=hour,
-                                minute=minute, second=second, microsecond=0)
-            time = Time(time)
-
-            status = mp4_file.read(1)
-            if len(status) < 1:
-                error_position = format(mp4_file.tell() - len(status), '#010x')
-                raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect'
-                                   ' a status character, but got EOF.')
-            status = status.decode('UTF-8')
-            if status not in ('A', 'V'):
-                error_position = format(mp4_file.tell() - 1, '#010x')
-                raise GpsDataError(f"{mp4_file.name}:{error_position}: Expect\
- `A' or `V' as a status character, but got an invalid character `{status}'.")
-
-            latitude_type = mp4_file.read(1)
-            if len(latitude_type) < 1:
-                error_position = format(
-                    mp4_file.tell() - len(latitude_type), '#010x')
-                raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect'
-                                   ' a latitude type, but got EOF.')
-            latitude_type = latitude_type.decode('UTF-8')
-            if status == 'A':
-                if latitude_type not in ('N', 'S'):
-                    error_position = format(mp4_file.tell() - 1, '#010x')
-                    raise GpsDataError(
-                        f"{mp4_file.name}:{error_position}: Expect `N' or `S'\
- as a latitude type, but got an invalid character `{latitude_type}'.")
+            if year == 0:
+                assert(month == 0)
+                assert(day == 0)
+                assert(hour == 0)
+                assert(minute == 0)
+                assert(second == 0)
+                time = None
             else:
-                assert(status == 'V')
-                if latitude_type != '0':
+                time = datetime.datetime.now(datetime.timezone.utc)
+                time = time.astimezone()
+                time = time.replace(
+                    year=year, month=month, day=day, hour=hour, minute=minute,
+                    second=second, microsecond=0)
+                time = Time(time)
+
+            if time is None:
+                padding = mp4_file.read(4)
+                if len(padding) < 4:
+                    error_position = format(mp4_file.tell() - len(padding),
+                                            '#010x')
+                    raise GpsDataError(f'{mp4_file.name}:{error_position}:'
+                                       ' Expect zero-padding, but got EOF.')
+                padding = int.from_bytes(padding, 'little')
+                if padding != 0:
+                    error_position = format(mp4_file.tell() - 4, '#010x')
+                    raise GpsDataError(
+                        f"{mp4_file.name}:{error_position}: Expect"
+                        f" zero-padding, but got `{padding}'.")
+                status = None
+                latitude_type = '0'
+                longitude_type = '0'
+            else:
+                status = mp4_file.read(1)
+                if len(status) < 1:
+                    error_position = format(mp4_file.tell() - len(status),
+                                            '#010x')
+                    raise GpsDataError(
+                        f'{mp4_file.name}:{error_position}: Expect a status'
+                        ' character, but got EOF.')
+                status = status.decode('UTF-8')
+                if status not in ('A', 'V'):
                     error_position = format(mp4_file.tell() - 1, '#010x')
                     raise GpsDataError(f"{mp4_file.name}:{error_position}:\
+ Expect `A' or `V' as a status character, but got an invalid character\
+ `{status}'.")
+
+                latitude_type = mp4_file.read(1)
+                if len(latitude_type) < 1:
+                    error_position = format(
+                        mp4_file.tell() - len(latitude_type), '#010x')
+                    raise GpsDataError(f'{mp4_file.name}:{error_position}:\
+ Expect a latitude type, but got EOF.')
+                latitude_type = latitude_type.decode('UTF-8')
+                if status == 'A':
+                    if latitude_type not in ('N', 'S'):
+                        error_position = format(mp4_file.tell() - 1, '#010x')
+                        raise GpsDataError(
+                            f"{mp4_file.name}:{error_position}: Expect `N' or\
+ `S' as a latitude type, but got an invalid character `{latitude_type}'.")
+                else:
+                    assert(status == 'V')
+                    if latitude_type != '0':
+                        error_position = format(mp4_file.tell() - 1, '#010x')
+                        raise GpsDataError(f"{mp4_file.name}:{error_position}:\
  Expect `0' as a latitude type, but got an invalid character\
  `{latitude_type}'.")
 
-            longitude_type = mp4_file.read(1)
-            if len(longitude_type) < 1:
-                error_position = format(
-                    mp4_file.tell() - len(longitude_type), '#010x')
-                raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect'
-                                   ' a longitude type, but got EOF.')
-            longitude_type = longitude_type.decode('UTF-8')
-            if status == 'A':
-                if longitude_type not in ('E', 'W'):
-                    error_position = format(mp4_file.tell() - 1, '#010x')
-                    raise GpsDataError(
-                        f"{mp4_file.name}:{error_position}: Expect `E' or `W'\
- as a longitude type, but got an invalid character `{longitude_type}'.")
-            else:
-                assert(status == 'V')
-                if longitude_type != '0':
-                    error_position = format(mp4_file.tell() - 1, '#010x')
-                    raise GpsDataError(f"{mp4_file.name}:{error_position}:\
+                longitude_type = mp4_file.read(1)
+                if len(longitude_type) < 1:
+                    error_position = format(
+                        mp4_file.tell() - len(longitude_type), '#010x')
+                    raise GpsDataError(f'{mp4_file.name}:{error_position}:\
+ Expect a longitude type, but got EOF.')
+                longitude_type = longitude_type.decode('UTF-8')
+                if status == 'A':
+                    if longitude_type not in ('E', 'W'):
+                        error_position = format(mp4_file.tell() - 1, '#010x')
+                        raise GpsDataError(
+                            f"{mp4_file.name}:{error_position}: Expect `E' or\
+ `W' as a longitude type, but got an invalid character `{longitude_type}'.")
+                else:
+                    assert(status == 'V')
+                    if longitude_type != '0':
+                        error_position = format(mp4_file.tell() - 1, '#010x')
+                        raise GpsDataError(f"{mp4_file.name}:{error_position}:\
  Expect `0' as a longitude type, but got an invalid character\
  `{longitude_type}'.")
 
-            padding = mp4_file.read(1)
-            if len(padding) < 1:
-                error_position = format(
-                    mp4_file.tell() - len(padding), '#010x')
-                raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect'
-                                   ' zero padding, but got EOF.')
-            if padding[0] != 0:
-                error_position = format(mp4_file.tell() - 1, '#010x')
-                byte = format(padding[0], '#04x')
-                raise GpsDataError(f"{mp4_file.name}:{error_position}: Expect\
- zero padding, but got an invalid byte `{byte}'.")
+                padding = mp4_file.read(1)
+                if len(padding) < 1:
+                    error_position = format(mp4_file.tell() - len(padding),
+                                            '#010x')
+                    raise GpsDataError(f'{mp4_file.name}:{error_position}:'
+                                       ' Expect zero padding, but got EOF.')
+                if padding[0] != 0:
+                    error_position = format(mp4_file.tell() - 1, '#010x')
+                    byte = format(padding[0], '#04x')
+                    raise GpsDataError(f"{mp4_file.name}:{error_position}:\
+ Expect zero padding, but got an invalid byte `{byte}'.")
 
             if status == 'A':
                 latitude_dmm = read_little_endian_single(mp4_file)
@@ -721,7 +781,7 @@ def parse_mp4_file(mp4_file_path: pathlib.Path) -> List[TrackPoint]:
                 latitude_degree += latitude_minute / 60
                 latitude = Latitude(latitude_degree)
             else:
-                assert(status == 'V')
+                assert(status == 'V' or status is None)
                 padding = mp4_file.read(4)
                 if len(padding) < 4:
                     error_position = format(
@@ -754,7 +814,7 @@ def parse_mp4_file(mp4_file_path: pathlib.Path) -> List[TrackPoint]:
                 longitude_degree += longitude_minute / 60
                 longitude = Longitude(longitude_degree)
             else:
-                assert(status == 'V')
+                assert(status == 'V' or status is None)
                 padding = mp4_file.read(4)
                 if len(padding) < 4:
                     error_position = format(
