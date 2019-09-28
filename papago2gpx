@@ -516,6 +516,16 @@ class TrackSegment(object):
         return iter(self._track_points)
 
 
+_UNKNOWN_BYTES\
+    = b'\x00\x21\x17\x00\x00\x00\x00\x00\x80\x01\x00\x00\x00\x00\x00\x00\
+\xBC\xC7\x17\x00\x00\x00\x00\x00\x80\x01\x00\x00\x00\x00\x00\x00\
+\x3C\xDB\x17\x00\x00\x00\x00\x00\x80\x01\x00\x00\x00\x00\x00\x00\
+\x18\xB5\x18\x00\x00\x00\x00\x00\x80\x01\x00\x00\x00\x00\x00\x00\
+\xA0\xFE\x19\x00\x00\x00\x00\x00\x80\x01\x00\x00\x00\x00\x00\x00\
+\x20\xF9\x1B\x00\x00\x00\x00\x00\x80\x01\x00\x00\x01\x00\x00\x00\
+\xAC\xB3\x1C\x00\x00\x00\x00\x00\x80\x01\x00\x00\x00\x00\x00\x00'
+
+
 def parse_mp4_file(mp4_file_path: pathlib.Path) -> List[TrackPoint]:
     track_points = []
 
@@ -881,15 +891,37 @@ def parse_mp4_file(mp4_file_path: pathlib.Path) -> List[TrackPoint]:
  the end of a GPS data block, but got additional data.')
 
             padding_size = large_block_end - small_block_end
+            if padding_size < 532:
+                error_position = format(mp4_file.tell(), '#010x')
+                raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect\
+ more than or equal to 532-byte padding, but got only {padding_size}-byte\
+ padding.')
             padding = mp4_file.read(padding_size)
             if len(padding) < padding_size:
                 error_position = format(
                     mp4_file.tell() - len(padding), '#010x')
                 raise GpsDataError(f'{mp4_file.name}:{error_position}: Expect\
- {padding_size}-byte zero padding, but got EOF.')
-            for j, b in enumerate(padding):
+ {padding_size}-byte padding, but got EOF.')
+            for j, b in enumerate(padding[:420]):
                 if b != 0:
-                    error_position = format(small_block_size + j, '#x010')
+                    error_position = format(small_block_end + j, '#010x')
+                    byte = format(b, '#04x')
+                    raise GpsDataError(f"{mp4_file.name}:{error_position}:\
+ Expect zero padding, but got an invalid byte `{byte}'.")
+            # `_UNKNOWN_BYTES` may appear in the zero padding. However,
+            # what this means is unknown. Therefore, just skip it if it
+            # appears.
+            if padding[420:532] != _UNKNOWN_BYTES:
+                for j, b in enumerate(padding[420:532]):
+                    if b != 0:
+                        error_position = format(small_block_end + 420 + j,
+                                                '#010x')
+                        byte = format(b, '#04x')
+                        raise GpsDataError(f"{mp4_file.name}:{error_position}:\
+ Expect zero padding, but got an invalid byte `{byte}'.")
+            for j, b in enumerate(padding[532:]):
+                if b != 0:
+                    error_position = format(small_block_end + 532 + j, '#010x')
                     byte = format(b, '#04x')
                     raise GpsDataError(f"{mp4_file.name}:{error_position}:\
  Expect zero padding, but got an invalid byte `{byte}'.")
