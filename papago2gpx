@@ -54,6 +54,9 @@ class Arguments(object):
             help=f"The type of the track. Default to `{_DEFAULT_TRACK_TYPE}'.")
         parser.add_argument('--csv', action='store_true',
                             help='Write a CSV file instead of GPX file.')
+        parser.add_argument('--uniq', choices=['first', 'last'],
+                            help='How to process different coordinates\
+ recorded at the same timestamp. Default to an error.')
         parser.add_argument('--overwrite', action='store_true',
                             help='Allow to overwrite an existing file.')
 
@@ -110,6 +113,7 @@ class Arguments(object):
             self._track_type = None
 
         self._csv = args.csv
+        self._how_to_unique = args.uniq
 
         self._overwrite = args.overwrite
 
@@ -168,6 +172,8 @@ class Arguments(object):
     @property
     def csv(self) -> bool:
         return self._csv
+    def how_to_unique(self) -> str:
+        return self._how_to_unique
 
     @property
     def overwrite(self) -> bool:
@@ -940,7 +946,7 @@ def write_csv_file(args: Arguments,
 
 
 def create_track_segments(
-        track_points: List[TrackPoint]) -> List[TrackSegment]:
+        args: Arguments, track_points: List[TrackPoint]) -> List[TrackSegment]:
     new_track_points = []
     for track_point in track_points:
         if track_point.status != 'A':
@@ -958,23 +964,31 @@ def create_track_segments(
         return []
 
     unique_track_points = []
-    unique_track_points.append(track_points[0])
+    it = iter(track_points)
+    representative_track_point = next(it)
+    while True:
+        track_point = next(it, None)
 
-    for track_point in track_points[1:]:
-        prev_track_point = unique_track_points[-1]
+        if track_point is None:
+            unique_track_points.append(representative_track_point)
+            break
 
-        if track_point == prev_track_point:
+        if track_point.time != representative_track_point.time:
+            unique_track_points.append(representative_track_point)
+            representative_track_point = track_point
             continue
 
-        if track_point.time == prev_track_point.time:
-            if track_point.latitude != prev_track_point.latitude:
-                raise RuntimeError('There exist track points with the same'
-                                   ' timestamp but different coordinates.')
-            if track_point.longitude != prev_track_point.longitude:
-                raise RuntimeError('There exist track points with the same'
-                                   ' timestamp but different coordinates.')
+        if track_point.latitude == representative_track_point.latitude\
+           and track_point.longitude == representative_track_point.longitude:
+            continue
 
-        unique_track_points.append(track_point)
+        if args.how_to_unique == 'first':
+            continue
+        elif args.how_to_unique == 'last':
+            representative_track_point = track_point
+        else:
+            raise RuntimeError("There exist track points with the same\
+ timestamp but different coordinates. Use `--uniq' option.")
 
     track_segments = []
     track_segments.append(TrackSegment())
@@ -1130,7 +1144,7 @@ if __name__ == '__main__':
         print(f"Succeeded! The result is output to `{csv_file_path}'.")
         sys.exit(0)
 
-    track_segments = create_track_segments(track_points)
+    track_segments = create_track_segments(args, track_points)
 
     if args.name is None and len(track_segments) == 0:
         print("`--name' is not specified, and there is no track segment.",
