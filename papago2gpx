@@ -52,8 +52,6 @@ class Arguments(object):
         parser.add_argument(
             '--track-type', default=_DEFAULT_TRACK_TYPE,
             help=f"The type of the track. Default to `{_DEFAULT_TRACK_TYPE}'.")
-        parser.add_argument('--csv', action='store_true',
-                            help='Write a CSV file instead of GPX file.')
         parser.add_argument('--uniq', choices=['first', 'last'],
                             help='How to process different coordinates\
  recorded at the same timestamp. Default to an error.')
@@ -112,7 +110,6 @@ class Arguments(object):
         if self._track_type == '':
             self._track_type = None
 
-        self._csv = args.csv
         self._how_to_unique = args.uniq
 
         self._overwrite = args.overwrite
@@ -170,8 +167,6 @@ class Arguments(object):
         return self._track_type
 
     @property
-    def csv(self) -> bool:
-        return self._csv
     def how_to_unique(self) -> str:
         return self._how_to_unique
 
@@ -1171,10 +1166,8 @@ if __name__ == '__main__':
 
     track_points = read_input_paths(args.input_paths)
 
-    if args.csv:
-        csv_file_path = write_csv_file(args, track_points)
-        print(f"Succeeded! The result is output to `{csv_file_path}'.")
-        sys.exit(0)
+    csv_file_path = write_csv_file(args, track_points)
+    print(f"Succeeded! The result is output to `{csv_file_path}'.")
 
     track_segments = create_track_segments(args, track_points)
 
